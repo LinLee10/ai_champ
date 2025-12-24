@@ -1,6 +1,5 @@
 import ast
 import asyncio
-import copy
 import hashlib
 import importlib.util
 import json
@@ -18,34 +17,29 @@ MAX_TOKENS = int(os.getenv("MAX_TOKENS", "600"))
 GLOBAL_SEED = int(os.getenv("GLOBAL_SEED", "0"))
 random.seed(GLOBAL_SEED)
 
-# Single source of truth for the public specification. This string is injected into
-# the user prompt and referenced by the grader to prevent drift between what the
-# agent is asked to build and what is actually graded.
 COMPUTE_GAE_SPEC = """
 Function: compute_gae(rewards, values, terminated, truncated, gamma, lam) -> advantages
 
-Inputs and shapes
-Rewards, terminated, truncated have shape T by B.
-Values has shape T plus 1 by B.
-Gamma and lam are either scalars applied to every timestep, or sequences of length T.
+Inputs
+- rewards: T x B list of lists (float)
+- values: (T+1) x B list of lists (float) - includes bootstrap value at index T
+- terminated: T x B list of lists (bool) - true episode termination
+- truncated: T x B list of lists (bool) - time-limit truncation (not true termination)
+- gamma: discount factor (float)
+- lam: GAE lambda parameter (float)
+
+Output
+- advantages: T x B list of lists (float)
 
 Validation
-Raise ValueError for any of the following:
-1) Any shape mismatch or ragged list for rewards, values, terminated, truncated.
-2) Any empty inner list in rewards, values, terminated, or truncated.
-3) Any rewards or values entry that is not a real number. Reject bool explicitly.
-4) Any terminated or truncated entry that is not exactly bool, 0, or 1.
-5) Gamma or lam given as a sequence whose length is not T.
-6) Any gamma or lam entry that is not a real number. Reject bool explicitly.
-7) Any gamma or lam value outside the inclusive range 0.0 to 1.0.
-Inputs must not be mutated.
+Raise ValueError if len(values) != len(rewards) + 1.
 
-Semantics
-Compute generalized advantage estimation by iterating backward from timestep T minus 1 to 0 for each batch index.
-Use per timestep schedules gamma_t and lam_t when gamma or lam are sequences.
-Termination controls value bootstrapping for the one step temporal difference, while truncation does not.
-Both termination and truncation stop the recursive accumulation of future advantage.
-Return advantages with shape T by B.
+Behavior
+Implement the Generalized Advantage Estimation algorithm. Process timesteps backward.
+The key distinction is how terminated vs truncated affect the TD error and advantage propagation:
+- terminated=True: The episode truly ended. Do not use the next value for bootstrapping.
+- truncated=True: Time limit was hit but episode didn't truly end. The next value IS valid for bootstrapping.
+- Both flags affect whether to propagate the accumulated advantage to earlier timesteps.
 
 """
 BUGGY_ADVANTAGE_CODE = """
@@ -60,10 +54,6 @@ def compute_gae(
     gamma: float | list[float],
     lam: float | list[float],
 ) -> list[list[float]]:
-    # Starter implementation with intentional bugs:
-    # - treats truncation as a terminal for value bootstrapping
-    # - scales recursive term by 0.5 on truncation instead of stopping it
-    # - minimal validation
     T = len(rewards)
     if len(values) != T + 1:
         raise ValueError("values must have length T+1")
@@ -103,67 +93,6 @@ def compute_gae(
 
 REFERENCE_ADVANTAGE_CODE = """
 from __future__ import annotations
-from typing import Sequence
-
-
-def _as_schedule(x: float | list[float], name: str, T: int) -> list[float]:
-    if isinstance(x, bool):
-        raise ValueError(f"{name} must be a real number, not bool")
-    if isinstance(x, (int, float)):
-        v = float(x)
-        if v < 0.0 or v > 1.0:
-            raise ValueError(f"{name} must be in [0.0, 1.0]")
-        return [v] * T
-    if isinstance(x, Sequence):
-        if len(x) != T:
-            raise ValueError(f"{name} list must have length T")
-        out: list[float] = []
-        for v in x:
-            if isinstance(v, bool):
-                raise ValueError(f"{name} entries must be real numbers, not bool")
-            if not isinstance(v, (int, float)):
-                raise ValueError(f"{name} entries must be numeric")
-            fv = float(v)
-            if fv < 0.0 or fv > 1.0:
-                raise ValueError(f"{name} entries must be in [0.0, 1.0]")
-            out.append(fv)
-        return out
-    raise ValueError(f"{name} must be float or sequence of floats")
-
-
-def _validate_inputs(rewards, values, terminated, truncated):
-    T = len(rewards)
-    if len(values) != T + 1:
-        raise ValueError("values must have length T + 1")
-    if len(terminated) != T or len(truncated) != T:
-        raise ValueError("shape mismatch")
-    if T == 0:
-        return 0, 0
-    B = len(rewards[0])
-    if B == 0:
-        raise ValueError("shape mismatch")
-    for seq in (rewards, terminated, truncated):
-        for row in seq:
-            if len(row) != B:
-                raise ValueError("shape mismatch")
-    for row in values:
-        if len(row) != B:
-            raise ValueError("shape mismatch")
-
-    for t in range(T):
-        for b in range(B):
-            if isinstance(rewards[t][b], bool) or not isinstance(rewards[t][b], (int, float)):
-                raise ValueError("rewards must be numeric")
-            if isinstance(values[t][b], bool) or not isinstance(values[t][b], (int, float)):
-                raise ValueError("values must be numeric")
-            if not isinstance(terminated[t][b], (bool, int)) or terminated[t][b] not in [False, True, 0, 1]:
-                raise ValueError("terminated must be bool/0/1")
-            if not isinstance(truncated[t][b], (bool, int)) or truncated[t][b] not in [False, True, 0, 1]:
-                raise ValueError("truncated must be bool/0/1")
-    for b in range(B):
-        if isinstance(values[T][b], bool) or not isinstance(values[T][b], (int, float)):
-            raise ValueError("values must be numeric")
-    return T, B
 
 
 def compute_gae(
@@ -171,28 +100,26 @@ def compute_gae(
     values: list[list[float]],
     terminated: list[list[bool]],
     truncated: list[list[bool]],
-    gamma: float | list[float],
-    lam: float | list[float],
+    gamma: float,
+    lam: float,
 ) -> list[list[float]]:
-    T, B = _validate_inputs(rewards, values, terminated, truncated)
+    T = len(rewards)
+    if len(values) != T + 1:
+        raise ValueError("values must have length T+1")
     if T == 0:
         return []
 
-    gammas = _as_schedule(gamma, "gamma", T)
-    lams = _as_schedule(lam, "lam", T)
-
+    B = len(rewards[0])
     adv = [[0.0 for _ in range(B)] for _ in range(T)]
     next_adv = [0.0 for _ in range(B)]
 
     for t in range(T - 1, -1, -1):
-        g = gammas[t]
-        l = lams[t]
         cur = [0.0 for _ in range(B)]
         for b in range(B):
             boot = 0.0 if bool(terminated[t][b]) else 1.0
-            delta = float(rewards[t][b]) + g * float(values[t + 1][b]) * boot - float(values[t][b])
+            delta = float(rewards[t][b]) + gamma * float(values[t + 1][b]) * boot - float(values[t][b])
             cont = 0.0 if (bool(terminated[t][b]) or bool(truncated[t][b])) else 1.0
-            cur[b] = delta + g * l * next_adv[b] * cont
+            cur[b] = delta + gamma * lam * next_adv[b] * cont
         adv[t] = cur
         next_adv = cur
     return adv
@@ -265,90 +192,30 @@ def _load_candidate_module() -> Any:
     return mod
 
 
-def _as_schedule(x: float | list[float], name: str, T: int) -> list[float]:
-    if isinstance(x, (int, float)):
-        return [float(x)] * T
-    if isinstance(x, (list, tuple)):
-        if len(x) != T:
-            raise ValueError(f"{name} list must have length T")
-        try:
-            return [float(v) for v in x]
-        except Exception as e:
-            raise ValueError(f"{name} entries must be numeric") from e
-    raise TypeError(f"{name} must be float or list[float]")
-
-
-def _validate_inputs(rewards, values, terminated, truncated):
+def _compute_gae_ref(rewards, values, terminated, truncated, gamma, lam):
     T = len(rewards)
     if len(values) != T + 1:
-        raise ValueError("values must have length T + 1")
-    if len(terminated) != T or len(truncated) != T:
-        raise ValueError("shape mismatch")
-    if T == 0:
-        return 0, 0
-    B = len(rewards[0])
-    if B == 0:
-        raise ValueError("shape mismatch")
-    for seq in (rewards, terminated, truncated):
-        for row in seq:
-            if len(row) != B:
-                raise ValueError("shape mismatch")
-    for row in values:
-        if len(row) != B:
-            raise ValueError("shape mismatch")
-
-    for t in range(T):
-        for b in range(B):
-            if not isinstance(rewards[t][b], (int, float)):
-                raise ValueError("rewards must be numeric")
-            if not isinstance(values[t][b], (int, float)):
-                raise ValueError("values must be numeric")
-            if not isinstance(terminated[t][b], (bool, int)) or terminated[t][b] not in [False, True, 0, 1]:
-                raise ValueError("terminated must be bool/0/1")
-            if not isinstance(truncated[t][b], (bool, int)) or truncated[t][b] not in [False, True, 0, 1]:
-                raise ValueError("truncated must be bool/0/1")
-    for b in range(B):
-        if not isinstance(values[T][b], (int, float)):
-            raise ValueError("values must be numeric")
-    return T, B
-
-
-def _compute_gae_ref(rewards, values, terminated, truncated, gamma, lam):
-    T, B = _validate_inputs(rewards, values, terminated, truncated)
+        raise ValueError("values must have length T+1")
     if T == 0:
         return []
 
-    gammas = _as_schedule(gamma, "gamma", T)
-    lams = _as_schedule(lam, "lam", T)
-
+    B = len(rewards[0])
     adv = [[0.0 for _ in range(B)] for _ in range(T)]
     next_adv = [0.0 for _ in range(B)]
 
     for t in range(T - 1, -1, -1):
-        g = gammas[t]
-        l = lams[t]
         cur = [0.0 for _ in range(B)]
         for b in range(B):
             boot = 0.0 if bool(terminated[t][b]) else 1.0
-            delta = float(rewards[t][b]) + g * float(values[t + 1][b]) * boot - float(values[t][b])
+            delta = float(rewards[t][b]) + gamma * float(values[t + 1][b]) * boot - float(values[t][b])
             cont = 0.0 if (bool(terminated[t][b]) or bool(truncated[t][b])) else 1.0
-            cur[b] = delta + g * l * next_adv[b] * cont
+            cur[b] = delta + gamma * lam * next_adv[b] * cont
         adv[t] = cur
         next_adv = cur
     return adv
 
 
 EPS = 1e-6
-
-
-def _max_abs_diff(a, b) -> float:
-    m = 0.0
-    for t in range(len(a)):
-        for j in range(len(a[t])):
-            d = abs(float(a[t][j]) - float(b[t][j]))
-            if d > m:
-                m = d
-    return m
 
 
 def _gen_case(seed: int, T: int, B: int):
@@ -413,8 +280,8 @@ def _run_checks() -> RunChecksToolResult:
         values: list[list[float]],
         terminated: list[list[bool]],
         truncated: list[list[bool]],
-        gamma: float | list[float],
-        lam: float | list[float],
+        gamma: float,
+        lam: float,
         mismatch_code: str,
         failures: list[str],
         exception_prefix: str,
@@ -429,150 +296,35 @@ def _run_checks() -> RunChecksToolResult:
             failures.append(mismatch_code)
         return None
 
-    def _expect_value_error(call, failure_label: str, failures: list[str]):
-        try:
-            call()
-            failures.append(failure_label)
-        except ValueError:
-            pass
-        except IndexError:
-            failures.append(failure_label)
-        except Exception as e:
-            failures.append(f"{failure_label}_wrong_exception:{type(e).__name__}")
-
-    _expect_value_error(
-        lambda: fn([[0.0]], [[0.0]], [[False]], [[False]], 0.9, 0.95),
-        "values_len_should_raise",
-        failures_public,
-    )
-
-    _expect_value_error(
-        lambda: fn([[0.0, 1.0]], [[0.0], [0.0]], [[False]], [[False, True]], 0.9, 0.95),
-        "shape_should_raise",
-        failures_public,
-    )
-
-    _expect_value_error(
-        lambda: fn([[True]], [[0.0], [0.0]], [[False]], [[False]], 0.9, 0.95),
-        "rewards_bool_should_raise",
-        failures_public,
-    )
-
-    _expect_value_error(
-        lambda: fn([[0.0]], [[True], [0.0]], [[False]], [[False]], 0.9, 0.95),
-        "values_bool_should_raise",
-        failures_public,
-    )
-
-    _expect_value_error(
-        lambda: fn([[0.0]], [[0.0], [0.0]], [[False]], [[False]], True, 0.95),
-        "gamma_bool_should_raise",
-        failures_public,
-    )
-
-    _expect_value_error(
-        lambda: fn([[0.0]], [[0.0], [0.0]], [[False]], [[False]], 1.1, 0.95),
-        "gamma_range_should_raise",
-        failures_public,
-    )
-
-    _expect_value_error(
-        lambda: fn([[0.0]], [[0.0], [0.0]], [[False]], [[False]], 0.9, -0.1),
-        "lam_range_should_raise",
-        failures_public,
-    )
-
-    _expect_value_error(
-        lambda: fn([[0.0], [0.0]], [[0.0], [0.0], [0.0]], [[False], [False]], [[False], [False]], [0.9, 1.2], [0.95, 0.95]),
-        "gamma_list_entry_range_should_raise",
-        failures_public,
-    )
-
-    _expect_value_error(
-        lambda: fn([[0.0], [0.0]], [[0.0], [0.0], [0.0]], [[False], [False]], [[False], [False]], [0.9, 0.9], [0.95, True]),
-        "lam_list_entry_bool_should_raise",
-        failures_public,
-    )
-
-    rewards = [[1.0], [1.0], [1.0]]
-    values = [[0.0], [0.5], [0.0], [0.0]]
-    terminated = [[False], [False], [True]]
-    truncated = [[False], [True], [False]]
-    gamma = 0.9
-    lam = 0.95
-    before = (copy.deepcopy(rewards), copy.deepcopy(values), copy.deepcopy(terminated), copy.deepcopy(truncated))
     try:
-        _ = fn(rewards, values, terminated, truncated, gamma, lam)
-    except Exception as e:
-        failures_public.append(f"public_exception:{type(e).__name__}")
-    after = (rewards, values, terminated, truncated)
-    if before != after:
-        failures_public.append("mutated_inputs")
+        fn([[0.0]], [[0.0]], [[False]], [[False]], 0.9, 0.95)
+        failures_public.append("values_len_should_raise")
+    except ValueError:
+        pass
+    except Exception:
+        failures_public.append("values_len_should_raise")
 
     _expect_match(
         [[1.0], [1.0], [1.0]],
         [[0.0], [0.5], [0.0], [0.0]],
         [[False], [False], [True]],
         [[False], [True], [False]],
-        0.9,
-        0.95,
-        "example_mismatch",
-        failures_public,
-        "public_exception",
+        0.9, 0.95, "example_mismatch", failures_public, "public_exception",
     )
-
-    try:
-        fn([[0.0]], [[0.0], [0.0]], [[False]], [[False]], [0.9, 0.9], 0.95)
-        failures_public.append("gamma_len_should_raise")
-    except ValueError:
-        pass
-    except Exception as e:
-        failures_public.append(f"gamma_len_wrong_exception:{type(e).__name__}")
 
     _expect_match(
         [[0.0], [0.0], [0.0]],
         [[0.0], [1.0], [2.0], [3.0]],
         [[False], [False], [False]],
         [[False], [True], [False]],
-        0.9,
-        0.95,
-        "boundary_truncation_mismatch",
-        failures_public,
-        "public_exception",
+        0.9, 0.95, "boundary_truncation_mismatch", failures_public, "public_exception",
     )
-
-    _expect_match(
-        [[0.2], [0.1], [0.0], [0.3]],
-        [[0.0], [0.1], [0.0], [0.1], [0.0]],
-        [[False], [False], [False], [True]],
-        [[False], [False], [True], [False]],
-        [0.9, 0.8, 0.9, 0.7],
-        [0.95, 0.9, 0.8, 0.7],
-        "gamma_lam_list_public_mismatch",
-        failures_public,
-        "public_exception",
-    )
-
-    try:
-        fn([[0.0]], [[0.0], [0.0]], [[False]], [[False]], 0.9, [0.95, 0.94])
-        failures_public.append("lam_len_should_raise")
-    except ValueError:
-        pass
-    except Exception as e:
-        failures_public.append(f"lam_len_wrong_exception:{type(e).__name__}")
 
     for seed in [0, 1, 2]:
         rewards, values, terminated, truncated = _gen_case(seed=seed, T=4, B=2)
         err = _expect_match(
-            rewards,
-            values,
-            terminated,
-            truncated,
-            0.9,
-            0.95,
-            "random_public_mismatch",
-            failures_public,
-            "public_exception",
+            rewards, values, terminated, truncated,
+            0.9, 0.95, "random_public_mismatch", failures_public, "public_exception",
         )
         if err is not None:
             break
@@ -580,15 +332,8 @@ def _run_checks() -> RunChecksToolResult:
     for seed in [10, 11, 12, 13, 14]:
         rewards, values, terminated, truncated = _gen_case(seed=seed, T=6, B=3)
         err = _expect_match(
-            rewards,
-            values,
-            terminated,
-            truncated,
-            0.97,
-            0.93,
-            "random_hidden_mismatch",
-            failures_hidden,
-            "hidden_exception",
+            rewards, values, terminated, truncated,
+            0.97, 0.93, "random_hidden_mismatch", failures_hidden, "hidden_exception",
         )
         if err is not None:
             break
@@ -598,11 +343,7 @@ def _run_checks() -> RunChecksToolResult:
         [[0.0], [0.0], [1.0]],
         [[False], [True]],
         [[False], [True]],
-        0.9,
-        0.95,
-        "both_true_boundary_mismatch",
-        failures_hidden,
-        "hidden_exception",
+        0.9, 0.95, "both_true_boundary_mismatch", failures_hidden, "hidden_exception",
     )
 
     return {
@@ -728,8 +469,7 @@ async def run_agent_loop(
     base_backoff = float(os.getenv("ANTHROPIC_RETRY_BACKOFF", "0.75"))
     last_text_chunks: list[str] = []
 
-    for step in range(max_steps):
-        last_error: Exception | None = None
+    for _ in range(max_steps):
         response = None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -741,16 +481,11 @@ async def run_agent_loop(
                     temperature=float(os.getenv("TEMPERATURE", "0.6")),
                 )
                 break
-            except Exception as e:  # Anthropic API errors or transport errors
-                last_error = e
+            except Exception as e:
                 if verbose:
-                    print(
-                        f"[warn] Anthropic call failed (attempt {attempt}/{max_attempts}): {e}"
-                    )
+                    print(f"[warn] Anthropic call failed (attempt {attempt}/{max_attempts}): {e}")
                 if attempt == max_attempts:
-                    raise RuntimeError(
-                        f"Anthropic API failed after {max_attempts} attempts: {e}"
-                    )
+                    raise RuntimeError(f"Anthropic API failed after {max_attempts} attempts: {e}")
                 await asyncio.sleep(base_backoff * (2 ** (attempt - 1)))
 
         if response is None:
@@ -817,7 +552,6 @@ async def run_agent_loop(
         else:
             break
 
-    # Fallback: if the agent produced plain text that looks like code, apply it once.
     text_blob = "\n".join([t for t in last_text_chunks if t.strip()])
     if "def compute_gae" in text_blob:
         candidate = text_blob
